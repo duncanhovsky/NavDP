@@ -5,6 +5,5 @@ __pycache__
 *.pt
 *.mp4
 *.jpg
-assets/scenes/Materials/*
-assets/scenes/SkyTexture/*
-assets/scenes/embodiedscan/*
+*.png
+assets/*

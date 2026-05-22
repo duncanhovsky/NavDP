@@ -19,7 +19,7 @@ parser.add_argument(
 parser.add_argument(
     "--port", type=int, default=8888)
 args_cli = parser.parse_args()
-app_launcher = AppLauncher(headless=True, enable_cameras=True)
+app_launcher = AppLauncher(headless=False, enable_cameras=True)
 simulation_app = app_launcher.app
 
 import omni
