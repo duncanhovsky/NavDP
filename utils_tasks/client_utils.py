@@ -5,6 +5,23 @@ import io
 import json
 import time
 
+def _response_json(response):
+    response.raise_for_status()
+    return response.json()
+
+def _parse_nav_response(response):
+    payload = _response_json(response)
+    required = ('trajectory', 'all_trajectory', 'all_values')
+    missing = [key for key in required if key not in payload]
+    if missing:
+        raise KeyError("navigator response missing keys: %s" % ", ".join(missing))
+    return (
+        np.array(payload['trajectory']),
+        np.array(payload['all_trajectory']),
+        np.array(payload['all_values']),
+        payload,
+    )
+
 def navigator_reset(intrinsic=None,stop_threshold=-0.5,batch_size=1,port=8888,env_id=None):
     print("http://localhost:%d/navigator_reset"%port)
     if env_id is None:
@@ -15,7 +32,7 @@ def navigator_reset(intrinsic=None,stop_threshold=-0.5,batch_size=1,port=8888,en
     else:
         url = "http://localhost:%d/navigator_reset_env"%port
         response = requests.post(url,json={'env_id':env_id})
-    return json.loads(response.text)['algo']
+    return _response_json(response)['algo']
 
 def nogoal_step(rgb_images,depth_images,port=8888):
     concat_images = np.concatenate([img for img in rgb_images],axis=0)
@@ -38,10 +55,9 @@ def nogoal_step(rgb_images,depth_images,port=8888):
         'depth_time':time.time(),
         'rgb_time':time.time(),
     }
-    response = requests.post(url, files=files, data=data)
-    trajectory = json.loads(response.text)['trajectory']
-    all_trajectory = json.loads(response.text)['all_trajectory']
-    all_value = json.loads(response.text)['all_values']
+    trajectory, all_trajectory, all_value, _ = _parse_nav_response(
+        requests.post(url, files=files, data=data)
+    )
     return np.array(trajectory),np.array(all_trajectory),np.array(all_value)
 
 def pointgoal_step(point_goals,rgb_images,depth_images,port=8888):
@@ -69,12 +85,11 @@ def pointgoal_step(point_goals,rgb_images,depth_images,port=8888):
         'depth_time':time.time(),
         'rgb_time':time.time(),
     }
-    response = requests.post(url, files=files, data=data)
-    trajectory = json.loads(response.text)['trajectory']
-    all_trajectory = json.loads(response.text)['all_trajectory']
-    all_value = json.loads(response.text)['all_values']
-    if 'sub_pointgoal_pd' in json.loads(response.text):
-        sub_pointgoal_pd = json.loads(response.text)['sub_pointgoal_pd']
+    trajectory, all_trajectory, all_value, payload = _parse_nav_response(
+        requests.post(url, files=files, data=data)
+    )
+    if 'sub_pointgoal_pd' in payload:
+        sub_pointgoal_pd = payload['sub_pointgoal_pd']
         return np.array(trajectory),np.array(all_trajectory),np.array(all_value),sub_pointgoal_pd
     else:
         return np.array(trajectory),np.array(all_trajectory),np.array(all_value)
@@ -107,10 +122,9 @@ def imagegoal_step(image_goals,rgb_images,depth_images,port=8888):
         'depth_time':time.time(),
         'rgb_time':time.time(),
     }
-    response = requests.post(url, files=files, data=data)
-    trajectory = json.loads(response.text)['trajectory']
-    all_trajectory = json.loads(response.text)['all_trajectory']
-    all_value = json.loads(response.text)['all_values']
+    trajectory, all_trajectory, all_value, _ = _parse_nav_response(
+        requests.post(url, files=files, data=data)
+    )
     return np.array(trajectory),np.array(all_trajectory),np.array(all_value)
 
 

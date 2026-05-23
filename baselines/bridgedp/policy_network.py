@@ -1,21 +1,13 @@
-"""Bridge-DP 策略网络（推理专用）。
+"""Standalone Bridge-DP inference policy for the NavDP evaluation server.
 
-独立 nn.Module，完全不依赖 NavDP 或其他 baseline。
-与 NavDP_Policy 的核心区别：
-1. 噪声调度：DDPMScheduler → BridgeScheduler（布朗桥）
-2. 动作空间：增量×4 → 绝对坐标 (x, y, θ)，训练时已归一化
-3. 新增模块：PriorEncoder + VisualGate（先验轨迹注入）
-4. memory 序列：[time, goal×3, rgbd] → [time, goal×3, rgbd, G·prior×N_p]
-5. 预测目标：噪声 ε → 归一化干净轨迹 x̂_0
-6. 推理后处理：反归一化 + 三次样条平滑
+The model outputs 24 absolute trajectory control points.  They are raw curve
+samples, not fixed-speed executable waypoints.  The agent wrapper converts them
+to execution waypoints after candidate scoring.
 """
-
-import math
 
 import numpy as np
 import torch
 import torch.nn as nn
-from scipy.interpolate import CubicSpline
 
 from bridge_scheduler import BridgeScheduler
 from policy_backbone import (
@@ -29,68 +21,158 @@ from prior_encoder import PriorEncoder, VisualGate
 
 
 class BridgeDP_Policy(nn.Module):
-    # ── 动作空间归一化参数（必须与训练数据集 bridgedp_lerobot_dataset.py 保持一致）──
-    ACTION_SCALE_XY = 5.0        # x, y 分量的归一化因子
-    ACTION_SCALE_THETA = 3.14159  # θ 分量的归一化因子（π）
+    ACTION_SCALE_XY = 5.0
+    ACTION_SCALE_THETA = 3.14159
 
-    def __init__(self,
-                 image_size=224,
-                 memory_size=8,
-                 predict_size=24,
-                 temporal_depth=16,
-                 heads=8,
-                 token_dim=384,
-                 sigma_base=1.0,
-                 sigma_goal=0.1,
-                 n_prior_tokens=4,
-                 dropout=0.1,
-                 channels=3,
-                 device='cuda:0'):
+    def __init__(
+        self,
+        image_size=224,
+        memory_size=8,
+        predict_size=24,
+        temporal_depth=16,
+        heads=8,
+        token_dim=384,
+        sigma_base=1.0,
+        sigma_goal=0.1,
+        sigma_floor=None,
+        nogoal_front_distance=0.8,
+        nogoal_sigma_start=0.03,
+        nogoal_sigma_x_end=0.35,
+        nogoal_sigma_y_end=0.80,
+        nogoal_sigma_theta_end=0.60,
+        nogoal_sigma_power=2.0,
+        bridge_scale_invariant_sigma=False,
+        bridge_anisotropic_xy=True,
+        bridge_normal_sigma_ratio=0.25,
+        bridge_tangent_sigma_ratio=0.03,
+        bridge_theta_sigma_ratio=0.05,
+        n_prior_tokens=4,
+        dropout=0.1,
+        channels=3,
+        enable_trajectory_normalization=False,
+        trajectory_norm_target_distance=2.0,
+        trajectory_norm_min_distance_m=0.10,
+        trajectory_norm_eps=1e-6,
+        enable_scale_condition_token=False,
+        scale_condition_clamp_min_m=0.10,
+        scale_condition_clamp_max_m=20.0,
+        enable_scale_rgbd_film=False,
+        scale_rgbd_film_alpha=1.0,
+        scale_rgbd_film_zero_init=True,
+        scale_rgbd_film_use_layernorm=True,
+        enable_goal_consistency_score=False,
+        goal_consistency_terminal_weight=1.0,
+        goal_consistency_path_weight=0.2,
+        num_train_timesteps=100,
+        num_inference_timesteps=100,
+        use_prior_traj=False,
+        device='cuda:0',
+    ):
         super().__init__()
+        _ = channels
         self.device = device
+        self._device = torch.device(device)
+        self.image_size = image_size
         self.memory_size = memory_size
         self.predict_size = predict_size
         self.token_dim = token_dim
         self.n_prior_tokens = n_prior_tokens
+        self.dropout = dropout
 
-        # 视觉编码器
+        self.action_scale_xy = self.ACTION_SCALE_XY
+        self.action_scale_theta = self.ACTION_SCALE_THETA
+        self.nogoal_front_distance = nogoal_front_distance
+        self.enable_trajectory_normalization = enable_trajectory_normalization
+        self.trajectory_norm_target_distance = float(trajectory_norm_target_distance)
+        self.trajectory_norm_min_distance_m = float(trajectory_norm_min_distance_m)
+        self.trajectory_norm_eps = float(trajectory_norm_eps)
+        self.enable_scale_condition_token = enable_scale_condition_token
+        self.scale_condition_clamp_min_m = float(scale_condition_clamp_min_m)
+        self.scale_condition_clamp_max_m = float(scale_condition_clamp_max_m)
+        self.n_scale_tokens = 1 if enable_scale_condition_token else 0
+        self.enable_scale_rgbd_film = enable_scale_rgbd_film
+        self.scale_rgbd_film_alpha = float(scale_rgbd_film_alpha)
+        self.scale_rgbd_film_zero_init = scale_rgbd_film_zero_init
+        self.scale_rgbd_film_use_layernorm = scale_rgbd_film_use_layernorm
+        self.enable_goal_consistency_score = enable_goal_consistency_score
+        self.goal_consistency_terminal_weight = float(goal_consistency_terminal_weight)
+        self.goal_consistency_path_weight = float(goal_consistency_path_weight)
+        self.num_train_timesteps = int(num_train_timesteps)
+        self.num_inference_timesteps = int(num_inference_timesteps)
+        self.use_prior_traj = use_prior_traj
+
         self.rgbd_encoder = BridgeDP_RGBD_Backbone(image_size, token_dim, memory_size, device)
         self.point_encoder = nn.Linear(3, token_dim)
         self.pixel_encoder = BridgeDP_PixelGoal_Backbone(image_size, token_dim, device=device)
         self.image_encoder = BridgeDP_ImageGoal_Backbone(image_size, token_dim, device=device)
 
-        # Transformer Decoder
-        self.decoder = nn.TransformerDecoder(
-            nn.TransformerDecoderLayer(
-                d_model=token_dim, nhead=heads,
-                dim_feedforward=4 * token_dim,
-                dropout=dropout, activation='gelu',
-                batch_first=True, norm_first=True,
-            ),
-            num_layers=temporal_depth,
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=token_dim,
+            nhead=heads,
+            dim_feedforward=4 * token_dim,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,
         )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=temporal_depth)
         self.input_embed = nn.Linear(3, token_dim)
 
-        # 位置编码：memory_size*16 + 4(time+goal×3) + n_prior_tokens
-        cond_len = memory_size * 16 + 4 + n_prior_tokens
+        cond_len = memory_size * 16 + 4 + self.n_scale_tokens + n_prior_tokens
         self.cond_pos_embed = LearnablePositionalEncoding(token_dim, cond_len)
         self.out_pos_embed = LearnablePositionalEncoding(token_dim, predict_size)
+        self.drop = nn.Dropout(dropout)
         self.time_emb = SinusoidalPosEmb(token_dim)
         self.layernorm = nn.LayerNorm(token_dim)
 
         self.action_head = nn.Linear(token_dim, 3)
+        self.delta_head = nn.Linear(token_dim, 3)
         self.critic_head = nn.Linear(token_dim, 1)
+        self.pixel_aux_head = nn.Linear(token_dim, 3)
+        self.image_aux_head = nn.Linear(token_dim, 3)
 
-        # Bridge-DP 专有模块
-        self.prior_encoder = PriorEncoder(token_dim, n_prior_tokens, dropout=dropout)
-        self.visual_gate = VisualGate(token_dim)
+        if self.enable_scale_condition_token:
+            self.scale_encoder = nn.Sequential(
+                nn.Linear(4, token_dim),
+                nn.GELU(),
+                nn.Linear(token_dim, token_dim),
+            )
+        if self.enable_scale_rgbd_film:
+            self.scale_rgbd_film = nn.Sequential(
+                nn.Linear(4, token_dim),
+                nn.GELU(),
+                nn.Linear(token_dim, 2 * token_dim),
+            )
+            if self.scale_rgbd_film_use_layernorm:
+                self.scale_rgbd_film_norm = nn.LayerNorm(token_dim)
+            if self.scale_rgbd_film_zero_init:
+                nn.init.zeros_(self.scale_rgbd_film[-1].weight)
+                nn.init.zeros_(self.scale_rgbd_film[-1].bias)
+
+        self.prior_encoder = PriorEncoder(
+            embed_dim=token_dim,
+            n_prior_tokens=n_prior_tokens,
+            dropout=dropout,
+        )
+        self.visual_gate = VisualGate(gate_dim=token_dim)
         self.bridge_scheduler = BridgeScheduler(
-            num_train_timesteps=100,
+            num_train_timesteps=self.num_train_timesteps,
             sigma_base=sigma_base,
             sigma_goal=sigma_goal,
+            sigma_floor=sigma_floor,
+            nogoal_front_distance=nogoal_front_distance,
+            nogoal_sigma_start=nogoal_sigma_start,
+            nogoal_sigma_x_end=nogoal_sigma_x_end,
+            nogoal_sigma_y_end=nogoal_sigma_y_end,
+            nogoal_sigma_theta_end=nogoal_sigma_theta_end,
+            nogoal_sigma_power=nogoal_sigma_power,
+            bridge_scale_invariant_sigma=bridge_scale_invariant_sigma,
+            bridge_anisotropic_xy=bridge_anisotropic_xy,
+            bridge_normal_sigma_ratio=bridge_normal_sigma_ratio,
+            bridge_tangent_sigma_ratio=bridge_tangent_sigma_ratio,
+            bridge_theta_sigma_ratio=bridge_theta_sigma_ratio,
         )
 
-        # 因果掩码
         self.tgt_mask = (torch.triu(torch.ones(predict_size, predict_size)) == 1).transpose(0, 1)
         self.tgt_mask = (
             self.tgt_mask.float()
@@ -98,372 +180,394 @@ class BridgeDP_Policy(nn.Module):
             .masked_fill(self.tgt_mask == 1, float(0.0))
         )
 
-        # Critic 掩码：屏蔽 time + goal×3 + prior tokens
         self.cond_critic_mask = torch.zeros((predict_size, cond_len))
-        self.cond_critic_mask[:, 0:4] = float('-inf')
-        self.cond_critic_mask[:, 4 + memory_size * 16:] = float('-inf')
+        rgbd_start = 4 + self.n_scale_tokens
+        self.cond_critic_mask[:, 0:rgbd_start] = float('-inf')
+        self.cond_critic_mask[:, rgbd_start + memory_size * 16:] = float('-inf')
 
     def to(self, device, *args, **kwargs):
         self = super().to(device, *args, **kwargs)
+        self.device = device
+        self._device = torch.device(device)
         self.cond_critic_mask = self.cond_critic_mask.to(device)
         self.tgt_mask = self.tgt_mask.to(device)
-        self.device = device
+        for module in (self.rgbd_encoder, self.pixel_encoder, self.image_encoder):
+            if hasattr(module, 'device'):
+                module.device = device
         return self
 
-    # ------------------------------------------------------------------
-    # 归一化 / 反归一化工具
-    # ------------------------------------------------------------------
-
     def _normalize_action(self, action):
-        """将原始绝对坐标归一化到训练空间。
-
-        Args:
-            action: (..., 3) 原始坐标 (x, y, θ)。
-
-        Returns:
-            归一化后的坐标。
-        """
         normed = action.clone()
-        normed[..., 0:2] = normed[..., 0:2] / self.ACTION_SCALE_XY
-        normed[..., 2] = normed[..., 2] / self.ACTION_SCALE_THETA
+        normed[..., 0:2] = normed[..., 0:2] / self.action_scale_xy
+        normed[..., 2] = normed[..., 2] / self.action_scale_theta
         return normed
 
     def _denormalize_action(self, action):
-        """将归一化坐标反归一化到原始物理空间。
-
-        Args:
-            action: (..., 3) 归一化坐标。
-
-        Returns:
-            原始物理坐标 (x, y, θ)。
-        """
         denormed = action.clone()
-        denormed[..., 0:2] = denormed[..., 0:2] * self.ACTION_SCALE_XY
-        denormed[..., 2] = denormed[..., 2] * self.ACTION_SCALE_THETA
+        denormed[..., 0:2] = denormed[..., 0:2] * self.action_scale_xy
+        denormed[..., 2] = denormed[..., 2] * self.action_scale_theta
         return denormed
 
-    # ------------------------------------------------------------------
-    # 核心网络前向
-    # ------------------------------------------------------------------
+    def _normalize_trajectory_action(self, action, traj_distance_m):
+        normed = action.clone()
+        distances = traj_distance_m.to(device=normed.device, dtype=normed.dtype).view(-1)
+        scale = self.trajectory_norm_target_distance / distances.clamp(min=self.trajectory_norm_eps)
+        if normed.dim() == 3:
+            scale = scale.view(-1, 1, 1)
+        elif normed.dim() == 2:
+            scale = scale.view(-1, 1)
+        else:
+            while scale.dim() < normed[..., 0:2].dim():
+                scale = scale.unsqueeze(-1)
+        normed[..., 0:2] = normed[..., 0:2] * scale
+        if normed.shape[-1] >= 3:
+            normed[..., 2] = normed[..., 2] / self.action_scale_theta
+        return normed
 
-    def _encode_prior(self, prior_traj):
-        """编码先验轨迹并应用视觉门控。"""
-        rgbd_embed = self._last_rgbd_embed  # 由调用方设置
-        prior_tokens = self.prior_encoder(prior_traj)
-        vis_global = rgbd_embed.mean(dim=1)
-        gate = self.visual_gate(vis_global)
-        return gate * prior_tokens
+    def _denormalize_trajectory_action(self, action, traj_distance_m):
+        denormed = action.clone()
+        distances = traj_distance_m.to(device=denormed.device, dtype=denormed.dtype).view(-1)
+        scale = distances / max(self.trajectory_norm_target_distance, self.trajectory_norm_eps)
+        if denormed.dim() == 3:
+            scale = scale.view(-1, 1, 1)
+        elif denormed.dim() == 2:
+            scale = scale.view(-1, 1)
+        else:
+            while scale.dim() < denormed[..., 0:2].dim():
+                scale = scale.unsqueeze(-1)
+        denormed[..., 0:2] = denormed[..., 0:2] * scale
+        if denormed.shape[-1] >= 3:
+            denormed[..., 2] = denormed[..., 2] * self.action_scale_theta
+        return denormed
 
-    def predict_x0(self, noisy_actions, timestep, goal_embed, rgbd_embed, prior_embed):
-        """预测归一化干净轨迹 x̂_0。
+    def _default_nogoal_distance(self, batch_size, device, dtype=torch.float32):
+        distance = self.nogoal_front_distance * self.action_scale_xy
+        return torch.full((batch_size,), distance, device=device, dtype=dtype)
 
-        注意：输入和输出均在归一化空间中。
-        """
+    def _build_scale_features(self, traj_distance_m):
+        d = traj_distance_m.to(device=self._device, dtype=torch.float32).view(-1)
+        d = d.clamp(
+            min=max(self.scale_condition_clamp_min_m, self.trajectory_norm_eps),
+            max=self.scale_condition_clamp_max_m,
+        )
+        target = max(self.trajectory_norm_target_distance, self.trajectory_norm_eps)
+        return torch.stack([d, torch.log(d), d.new_full(d.shape, target) / d, d / target], dim=-1)
+
+    def _build_scale_token(self, traj_distance_m, like_token=None):
+        if not self.enable_scale_condition_token:
+            if like_token is not None:
+                return like_token.new_zeros((like_token.shape[0], 0, like_token.shape[-1]))
+            return torch.zeros((traj_distance_m.shape[0], 0, self.token_dim), device=self._device)
+        token = self.scale_encoder(self._build_scale_features(traj_distance_m)).unsqueeze(1)
+        if like_token is not None:
+            token = token.to(device=like_token.device, dtype=like_token.dtype)
+        return token
+
+    def _apply_scale_rgbd_film(self, rgbd_embed, traj_distance_m):
+        if not self.enable_scale_rgbd_film:
+            return rgbd_embed
+        feat = self._build_scale_features(traj_distance_m)
+        batch_size = rgbd_embed.shape[0]
+        if feat.shape[0] == 1 and batch_size > 1:
+            feat = feat.expand(batch_size, -1)
+        elif feat.shape[0] != batch_size:
+            raise ValueError(
+                f"scale batch size {feat.shape[0]} does not match rgbd batch size {batch_size}"
+            )
+        gamma_beta = self.scale_rgbd_film(feat).to(device=rgbd_embed.device, dtype=rgbd_embed.dtype)
+        gamma, beta = gamma_beta.chunk(2, dim=-1)
+        base = self.scale_rgbd_film_norm(rgbd_embed) if self.scale_rgbd_film_use_layernorm else rgbd_embed
+        return rgbd_embed + self.scale_rgbd_film_alpha * (base * gamma.unsqueeze(1) + beta.unsqueeze(1))
+
+    def _make_prior_tokens(self, tensor_prior, rgbd_embed):
+        if self.use_prior_traj:
+            prior_tokens = self.prior_encoder(tensor_prior)
+            gate = self.visual_gate(rgbd_embed.mean(dim=1))
+            return gate * prior_tokens
+        return torch.zeros(
+            tensor_prior.shape[0],
+            self.n_prior_tokens,
+            self.token_dim,
+            device=rgbd_embed.device,
+            dtype=rgbd_embed.dtype,
+        )
+
+    def predict_x0(self, noisy_actions, timestep, goal_embed, rgbd_embed, prior_embed, scale_embed=None):
         action_embeds = self.input_embed(noisy_actions)
-        time_embeds = self.time_emb(timestep.to(self.device)).unsqueeze(1)
+        time_embeds = self.time_emb(timestep.to(self._device).view(-1)).unsqueeze(1)
+        cond_batch = goal_embed.shape[0]
+        if time_embeds.shape[0] == 1 and cond_batch > 1:
+            time_embeds = time_embeds.expand(cond_batch, -1, -1)
+
+        if scale_embed is None:
+            scale_embed = self._build_scale_token(
+                self._default_nogoal_distance(cond_batch, self._device),
+                like_token=goal_embed,
+            )
 
         cond_tokens = torch.cat(
-            [time_embeds, goal_embed, goal_embed, goal_embed, rgbd_embed, prior_embed],
+            [time_embeds, scale_embed, goal_embed, goal_embed, goal_embed, rgbd_embed, prior_embed],
             dim=1,
         )
         cond_embedding = cond_tokens + self.cond_pos_embed(cond_tokens)
-        cond_embedding = cond_embedding.repeat(
-            action_embeds.shape[0] // cond_embedding.shape[0], 1, 1
-        )
+        cond_embedding = cond_embedding.repeat(action_embeds.shape[0] // cond_embedding.shape[0], 1, 1)
 
         input_embedding = action_embeds + self.out_pos_embed(action_embeds)
-
         output = self.decoder(
-            tgt=input_embedding, memory=cond_embedding,
-            tgt_mask=self.tgt_mask.to(self.device),
+            tgt=input_embedding,
+            memory=cond_embedding,
+            tgt_mask=self.tgt_mask.to(self._device),
         )
-        output = self.layernorm(output)
-        return self.action_head(output)
+        return self.action_head(self.layernorm(output))
 
-    def predict_critic(self, predict_trajectory, rgbd_embed):
-        """Critic 评分，不使用先验信息。"""
-        repeat_rgbd = rgbd_embed.repeat(predict_trajectory.shape[0], 1, 1)
-        nogoal = torch.zeros_like(repeat_rgbd[:, 0:1])
+    def predict_critic(self, predict_trajectory, rgbd_embed, scale_embed=None):
+        repeat_factor = max(1, predict_trajectory.shape[0] // rgbd_embed.shape[0])
+        repeat_rgbd_embed = rgbd_embed.repeat(repeat_factor, 1, 1)
+        nogoal_embed = torch.zeros_like(repeat_rgbd_embed[:, 0:1])
+
+        if scale_embed is None:
+            scale_embed = self._build_scale_token(
+                self._default_nogoal_distance(rgbd_embed.shape[0], rgbd_embed.device, rgbd_embed.dtype),
+                like_token=rgbd_embed[:, 0:1],
+            )
+        repeat_scale_embed = scale_embed.repeat(repeat_factor, 1, 1)
+
         zero_prior = torch.zeros(
-            repeat_rgbd.shape[0], self.n_prior_tokens, self.token_dim,
-            device=repeat_rgbd.device,
+            repeat_rgbd_embed.shape[0],
+            self.n_prior_tokens,
+            self.token_dim,
+            device=repeat_rgbd_embed.device,
+            dtype=repeat_rgbd_embed.dtype,
         )
         action_embeddings = self.input_embed(predict_trajectory)
         action_embeddings = action_embeddings + self.out_pos_embed(action_embeddings)
         cond_tokens = torch.cat(
-            [nogoal, nogoal, nogoal, nogoal, repeat_rgbd, zero_prior], dim=1
+            [
+                nogoal_embed,
+                repeat_scale_embed,
+                nogoal_embed,
+                nogoal_embed,
+                nogoal_embed,
+                repeat_rgbd_embed,
+                zero_prior,
+            ],
+            dim=1,
         )
         cond_embeddings = cond_tokens + self.cond_pos_embed(cond_tokens)
         critic_output = self.decoder(
-            tgt=action_embeddings, memory=cond_embeddings,
-            memory_mask=self.cond_critic_mask.to(self.device),
+            tgt=action_embeddings,
+            memory=cond_embeddings,
+            memory_mask=self.cond_critic_mask.to(self._device),
         )
         return self.critic_head(self.layernorm(critic_output).mean(dim=1))[:, 0]
 
-    # ------------------------------------------------------------------
-    # 去噪 + 后处理
-    # ------------------------------------------------------------------
+    def _apply_goal_consistency_score(self, critic_values, trajectories, goals, origins=None):
+        if not self.enable_goal_consistency_score:
+            return critic_values
+        if goals.dim() == 3:
+            goals = goals[:, -1, :]
+        if origins is None:
+            origins = torch.zeros_like(goals)
+        elif origins.dim() == 3:
+            origins = origins[:, -1, :]
 
-    def _denoise(self, goal_embed, rgbd_embed, gated_prior,
-                 goal_point_normed, theta_g, sample_num):
-        """通用去噪流程（在归一化空间中操作）。
-
-        Args:
-            goal_embed: 目标嵌入 (B, 1, d)。
-            rgbd_embed: RGBD 嵌入 (B, mem*16, d)。
-            gated_prior: 门控先验 (B, N_p, d)。
-            goal_point_normed: 归一化目标坐标 (B, 3)。
-            theta_g: 目标方位角（原始值，不归一化）(B,)。
-            sample_num: 候选轨迹数。
-
-        Returns:
-            (naction, critic_values): 归一化空间中的轨迹和评分。
-        """
-        B = goal_point_normed.shape[0]
-        # 桥终点 = goal_point（归一化后量级与轨迹末端接近，作为桥的终点锚）
-        bridge_endpoint = goal_point_normed  # (B, 3)
-        endpoint_for_init = bridge_endpoint.repeat(sample_num, 1)
-        naction = self.bridge_scheduler.sample_initial_noise(
-            endpoint_for_init, (sample_num * B, self.predict_size, 3), self.device
+        terminal_err = torch.norm(trajectories[:, -1, :2] - goals[:, :2], dim=-1)
+        path_len = torch.norm(trajectories[:, 1:, :2] - trajectories[:, :-1, :2], dim=-1).sum(dim=-1)
+        goal_dist = torch.norm(goals[:, :2] - origins[:, :2], dim=-1)
+        penalty = (
+            self.goal_consistency_terminal_weight * terminal_err
+            + self.goal_consistency_path_weight * torch.relu(path_len - goal_dist)
         )
+        return critic_values - penalty
 
-        self.bridge_scheduler.set_timesteps(self.bridge_scheduler.config.num_train_timesteps)
-        endpoint_expanded = bridge_endpoint.unsqueeze(1).expand(
-            -1, self.predict_size, -1
-        ).repeat(sample_num, 1, 1)
-        theta_expanded = theta_g.repeat(sample_num)
+    def _reshape_candidates(self, trajectory_flat, values_flat, batch_size, sample_num):
+        trajectory = trajectory_flat.reshape(sample_num, batch_size, self.predict_size, 3).permute(1, 0, 2, 3)
+        values = values_flat.reshape(sample_num, batch_size).permute(1, 0)
+        return trajectory, values
 
-        for k in self.bridge_scheduler.timesteps:
-            x0_pred = self.predict_x0(
-                naction, k.to(self.device).unsqueeze(0),
-                goal_embed, rgbd_embed, gated_prior,
-            )
-            naction = self.bridge_scheduler.step(
-                x0_pred, naction, k, endpoint_expanded, theta_expanded,
-            )
+    def _select_topk(self, trajectory, values, topk=2):
+        topk = min(topk, trajectory.shape[1])
+        sorted_pos = (-values).argsort(dim=1)
+        sorted_neg = values.argsort(dim=1)
+        batch_idx = torch.arange(trajectory.shape[0], device=trajectory.device).unsqueeze(1).expand(-1, topk)
+        positive = trajectory[batch_idx, sorted_pos[:, :topk]]
+        negative = trajectory[batch_idx, sorted_neg[:, :topk]]
+        return positive, negative
 
-        critic_values = self.predict_critic(naction, rgbd_embed)
-        return naction, critic_values
-
-    def _postprocess(self, naction_normed, critic_values, B, sample_num):
-        """反归一化 + 三次样条平滑 + 按 critic 排序。
-
-        Args:
-            naction_normed: 归一化空间的轨迹 (B*S, T, 3)。
-            critic_values: Critic 评分 (B*S,)。
-            B: batch size。
-            sample_num: 候选数。
-
-        Returns:
-            (all_traj, values, pos, neg): 反归一化后的物理空间轨迹。
-        """
-        # 反归一化到物理空间
-        naction = self._denormalize_action(naction_normed)
-
-        trajectory = _smooth_trajectory_batch(naction)
-        trajectory = trajectory.reshape(B, sample_num, self.predict_size, 3)
-        critic_values = critic_values.reshape(B, sample_num)
-
-        sorted_pos = (-critic_values).argsort(dim=1)
-        sorted_neg = critic_values.argsort(dim=1)
-        batch_idx = torch.arange(B).unsqueeze(1).expand(-1, 2)
-        positive_trajectory = trajectory[batch_idx, sorted_pos[:, 0:2]]
-        negative_trajectory = trajectory[batch_idx, sorted_neg[:, 0:2]]
-
+    def _to_numpy_response(self, trajectory, values, positive, negative):
         return (
-            trajectory.cpu().numpy(),
-            critic_values.cpu().numpy(),
-            positive_trajectory.cpu().numpy(),
-            negative_trajectory.cpu().numpy(),
+            trajectory.detach().cpu().numpy(),
+            values.detach().cpu().numpy(),
+            positive.detach().cpu().numpy(),
+            negative.detach().cpu().numpy(),
         )
 
-    # ------------------------------------------------------------------
-    # 推理入口
-    # ------------------------------------------------------------------
+    def _prepare_prior(self, prior_traj, batch_size, distance_for_norm=None):
+        if prior_traj is None:
+            return torch.zeros(batch_size, self.predict_size, 3, device=self._device)
+        tensor_prior = torch.as_tensor(prior_traj, dtype=torch.float32, device=self._device)
+        if self.enable_trajectory_normalization and distance_for_norm is not None:
+            return self._normalize_trajectory_action(tensor_prior, distance_for_norm)
+        return self._normalize_action(tensor_prior)
 
-    def predict_pointgoal_action(self, goal_point, input_images, input_depths,
-                                  prior_traj=None, theta_g=None, sample_num=16):
-        """PointGoal 推理。
-
-        Args:
-            goal_point: (B, 3) 原始物理坐标目标。
-            input_images: (B, mem, H, W, 3) RGB 图像。
-            input_depths: (B, H, W, 1) 深度图。
-            prior_traj: (B, T, 3) 原始物理坐标先验轨迹，可选。
-            theta_g: (B,) 目标方位角，可选。
-            sample_num: 候选轨迹数量。
-
-        Returns:
-            (all_trajectory, critic_values, positive_trajectory, negative_trajectory)
-        """
+    def predict_pointgoal_action(self, goal_point, input_images, input_depths, prior_traj=None, theta_g=None, sample_num=16):
         with torch.no_grad():
-            tensor_goal = torch.as_tensor(goal_point, dtype=torch.float32, device=self.device)
+            tensor_goal = torch.as_tensor(goal_point, dtype=torch.float32, device=self._device)
             B = tensor_goal.shape[0]
+            goal_distance_m = torch.norm(tensor_goal[:, :2], dim=-1)
+            distance_for_norm = goal_distance_m.clamp(min=self.trajectory_norm_min_distance_m)
+            arrived_mask = goal_distance_m < self.trajectory_norm_min_distance_m
 
-            # 计算 theta_g（在归一化之前，使用原始坐标）
-            tensor_theta = (
-                torch.as_tensor(theta_g, dtype=torch.float32, device=self.device)
-                if theta_g is not None
-                else torch.atan2(tensor_goal[:, 1], tensor_goal[:, 0])
-            )
+            if theta_g is not None:
+                tensor_theta = torch.as_tensor(theta_g, dtype=torch.float32, device=self._device)
+            else:
+                tensor_theta = torch.atan2(tensor_goal[:, 1], tensor_goal[:, 0])
 
-            # ── 归一化：将物理坐标映射到训练空间 ──
-            tensor_goal_normed = self._normalize_action(tensor_goal)
+            if self.enable_trajectory_normalization:
+                tensor_goal_n = self._normalize_trajectory_action(tensor_goal, distance_for_norm)
+            else:
+                tensor_goal_n = self._normalize_action(tensor_goal)
 
             rgbd_embed = self.rgbd_encoder(input_images, input_depths)
-            goal_embed = self.point_encoder(tensor_goal_normed).unsqueeze(1)
+            goal_embed = self.point_encoder(tensor_goal_n).unsqueeze(1)
+            scale_embed = self._build_scale_token(distance_for_norm, like_token=goal_embed)
+            rgbd_embed = self._apply_scale_rgbd_film(rgbd_embed, distance_for_norm)
 
-            # 先验轨迹：归一化后编码
-            if prior_traj is not None:
-                tensor_prior = torch.as_tensor(prior_traj, dtype=torch.float32, device=self.device)
-                tensor_prior = self._normalize_action(tensor_prior)
-            else:
-                tensor_prior = torch.zeros(B, self.predict_size, 3, device=self.device)
+            tensor_prior = self._prepare_prior(prior_traj, B, distance_for_norm)
+            gated_prior = self._make_prior_tokens(tensor_prior, rgbd_embed)
 
-            prior_tokens = self.prior_encoder(tensor_prior)
-            gate_value = self.visual_gate(rgbd_embed.mean(dim=1))
-            gated_prior = gate_value * prior_tokens
-
-            naction, critic_values = self._denoise(
-                goal_embed, rgbd_embed, gated_prior,
-                tensor_goal_normed, tensor_theta, sample_num
+            origin = torch.zeros_like(tensor_goal_n)
+            naction = self.bridge_scheduler.sample_initial_noise_ordered(
+                goal=tensor_goal_n.repeat(sample_num, 1),
+                origin=origin.repeat(sample_num, 1),
+                shape=(sample_num * B, self.predict_size, 3),
+                device=self._device,
             )
-            return self._postprocess(naction, critic_values, B, sample_num)
 
-    def predict_nogoal_action(self, input_images, input_depths,
-                               prior_traj=None, sample_num=16):
-        """NoGoal 推理（自由探索）。
+            self.bridge_scheduler.set_timesteps(self.num_inference_timesteps)
+            goal_repeated = tensor_goal_n.repeat(sample_num, 1)
+            origin_repeated = origin.repeat(sample_num, 1)
+            theta_repeated = tensor_theta.repeat(sample_num)
+            if self.enable_trajectory_normalization:
+                distance_repeated = distance_for_norm.repeat(sample_num)
 
-        Returns:
-            (all_trajectory, critic_values, positive_trajectory, negative_trajectory)
-        """
+            for k in self.bridge_scheduler.timesteps:
+                x0_pred = self.predict_x0(
+                    naction,
+                    k.to(self._device).unsqueeze(0),
+                    goal_embed,
+                    rgbd_embed,
+                    gated_prior,
+                    scale_embed,
+                )
+                naction = self.bridge_scheduler.step_trajectory(
+                    x0_pred,
+                    naction,
+                    k,
+                    goal=goal_repeated,
+                    theta_g=theta_repeated,
+                    origin=origin_repeated,
+                    mode="pointgoal",
+                )
+
+            critic_values = self.predict_critic(naction, rgbd_embed, scale_embed)
+            score_values = self._apply_goal_consistency_score(
+                critic_values, naction, goal_repeated, origin_repeated
+            )
+
+            if self.enable_trajectory_normalization:
+                trajectory_flat = self._denormalize_trajectory_action(naction, distance_repeated)
+            else:
+                trajectory_flat = self._denormalize_action(naction)
+
+            trajectory, values = self._reshape_candidates(trajectory_flat, score_values, B, sample_num)
+            if arrived_mask.any():
+                trajectory[arrived_mask] = 0.0
+            positive, negative = self._select_topk(trajectory, values)
+            return self._to_numpy_response(trajectory, values, positive, negative)
+
+    def predict_nogoal_action(self, input_images, input_depths, prior_traj=None, sample_num=16):
         with torch.no_grad():
             rgbd_embed = self.rgbd_encoder(input_images, input_depths)
             B = rgbd_embed.shape[0]
             nogoal_embed = torch.zeros_like(rgbd_embed[:, 0:1])
+            nogoal_distance_m = self._default_nogoal_distance(B, self._device, dtype=rgbd_embed.dtype)
+            scale_embed = self._build_scale_token(nogoal_distance_m, like_token=nogoal_embed)
+            rgbd_embed = self._apply_scale_rgbd_film(rgbd_embed, nogoal_distance_m)
 
-            zero_goal = torch.zeros(B, 3, device=self.device)
-            zero_theta = torch.zeros(B, device=self.device)
+            tensor_prior = self._prepare_prior(prior_traj, B)
+            gated_prior = self._make_prior_tokens(tensor_prior, rgbd_embed)
 
-            if prior_traj is not None:
-                tensor_prior = torch.as_tensor(prior_traj, dtype=torch.float32, device=self.device)
-                tensor_prior = self._normalize_action(tensor_prior)
-            else:
-                tensor_prior = torch.zeros(B, self.predict_size, 3, device=self.device)
-
-            prior_tokens = self.prior_encoder(tensor_prior)
-            gated_prior = self.visual_gate(rgbd_embed.mean(dim=1)) * prior_tokens
-
-            naction, critic_values = self._denoise(
-                nogoal_embed, rgbd_embed, gated_prior, zero_goal, zero_theta, sample_num
+            naction = self.bridge_scheduler.sample_initial_noise_nogoal(
+                (sample_num * B, self.predict_size, 3),
+                self._device,
+                dtype=rgbd_embed.dtype,
             )
+            self.bridge_scheduler.set_timesteps(self.num_inference_timesteps)
 
-            # 反归一化
-            naction = self._denormalize_action(naction)
+            for k in self.bridge_scheduler.timesteps:
+                x0_pred = self.predict_x0(
+                    naction,
+                    k.to(self._device).unsqueeze(0),
+                    nogoal_embed,
+                    rgbd_embed,
+                    gated_prior,
+                    scale_embed,
+                )
+                naction = self.bridge_scheduler.step_trajectory(x0_pred, naction, k, mode="nogoal")
 
-            # NoGoal：惩罚过短轨迹
-            trajectory = _smooth_trajectory_batch(naction)
-            trajectory = trajectory.reshape(B, sample_num, self.predict_size, 3)
-            critic_values = critic_values.reshape(B, sample_num)
-            traj_length = trajectory[:, :, -1, 0:2].norm(dim=-1)
-            critic_values[traj_length < 1.0] -= 10.0
+            critic_values = self.predict_critic(naction, rgbd_embed, scale_embed)
+            trajectory_flat = self._denormalize_action(naction)
+            trajectory, values = self._reshape_candidates(trajectory_flat, critic_values, B, sample_num)
+            traj_length = torch.norm(trajectory[:, :, -1, 0:2], dim=-1)
+            values = values.clone()
+            values[traj_length < 1.0] -= 10.0
+            positive, negative = self._select_topk(trajectory, values)
+            return self._to_numpy_response(trajectory, values, positive, negative)
 
-            sorted_pos = (-critic_values).argsort(dim=1)
-            sorted_neg = critic_values.argsort(dim=1)
-            batch_idx = torch.arange(B).unsqueeze(1).expand(-1, 2)
-            positive_trajectory = trajectory[batch_idx, sorted_pos[:, 0:2]]
-            negative_trajectory = trajectory[batch_idx, sorted_neg[:, 0:2]]
+    def _predict_with_goal_embed(self, goal_embed, rgbd_embed, prior_traj=None, sample_num=16):
+        B = rgbd_embed.shape[0]
+        nogoal_distance_m = self._default_nogoal_distance(B, self._device, dtype=rgbd_embed.dtype)
+        scale_embed = self._build_scale_token(nogoal_distance_m, like_token=goal_embed)
+        rgbd_embed = self._apply_scale_rgbd_film(rgbd_embed, nogoal_distance_m)
+        tensor_prior = self._prepare_prior(prior_traj, B)
+        gated_prior = self._make_prior_tokens(tensor_prior, rgbd_embed)
 
-            return (
-                trajectory.cpu().numpy(),
-                critic_values.cpu().numpy(),
-                positive_trajectory.cpu().numpy(),
-                negative_trajectory.cpu().numpy(),
+        naction = self.bridge_scheduler.sample_initial_noise_nogoal(
+            (sample_num * B, self.predict_size, 3),
+            self._device,
+            dtype=rgbd_embed.dtype,
+        )
+        self.bridge_scheduler.set_timesteps(self.num_inference_timesteps)
+        for k in self.bridge_scheduler.timesteps:
+            x0_pred = self.predict_x0(
+                naction,
+                k.to(self._device).unsqueeze(0),
+                goal_embed,
+                rgbd_embed,
+                gated_prior,
+                scale_embed,
             )
+            naction = self.bridge_scheduler.step_trajectory(x0_pred, naction, k, mode="nogoal")
 
-    def predict_imagegoal_action(self, goal_image, input_images, input_depths,
-                                  prior_traj=None, sample_num=16):
-        """ImageGoal 推理。
+        critic_values = self.predict_critic(naction, rgbd_embed, scale_embed)
+        trajectory_flat = self._denormalize_action(naction)
+        trajectory, values = self._reshape_candidates(trajectory_flat, critic_values, B, sample_num)
+        positive, negative = self._select_topk(trajectory, values)
+        return self._to_numpy_response(trajectory, values, positive, negative)
 
-        Returns:
-            (all_trajectory, critic_values, positive_trajectory, negative_trajectory)
-        """
+    def predict_imagegoal_action(self, goal_image, input_images, input_depths, prior_traj=None, sample_num=16):
         with torch.no_grad():
             rgbd_embed = self.rgbd_encoder(input_images, input_depths)
-            B = rgbd_embed.shape[0]
             imagegoal_embed = self.image_encoder(
                 np.concatenate((goal_image, input_images[:, -1]), axis=-1)
             ).unsqueeze(1)
+            return self._predict_with_goal_embed(imagegoal_embed, rgbd_embed, prior_traj, sample_num)
 
-            zero_goal = torch.zeros(B, 3, device=self.device)
-            zero_theta = torch.zeros(B, device=self.device)
-
-            if prior_traj is not None:
-                tensor_prior = torch.as_tensor(prior_traj, dtype=torch.float32, device=self.device)
-                tensor_prior = self._normalize_action(tensor_prior)
-            else:
-                tensor_prior = torch.zeros(B, self.predict_size, 3, device=self.device)
-
-            prior_tokens = self.prior_encoder(tensor_prior)
-            gated_prior = self.visual_gate(rgbd_embed.mean(dim=1)) * prior_tokens
-
-            naction, critic_values = self._denoise(
-                imagegoal_embed, rgbd_embed, gated_prior, zero_goal, zero_theta, sample_num
-            )
-            return self._postprocess(naction, critic_values, B, sample_num)
-
-    def predict_pixelgoal_action(self, goal_image, input_images, input_depths,
-                                  prior_traj=None, sample_num=16):
-        """PixelGoal 推理。
-
-        Returns:
-            (all_trajectory, critic_values, positive_trajectory, negative_trajectory)
-        """
+    def predict_pixelgoal_action(self, goal_image, input_images, input_depths, prior_traj=None, sample_num=16):
         with torch.no_grad():
             rgbd_embed = self.rgbd_encoder(input_images, input_depths)
-            B = rgbd_embed.shape[0]
             pixelgoal_embed = self.pixel_encoder(
                 np.concatenate((goal_image[:, :, :, None], input_images[:, -1]), axis=-1)
             ).unsqueeze(1)
-
-            zero_goal = torch.zeros(B, 3, device=self.device)
-            zero_theta = torch.zeros(B, device=self.device)
-
-            if prior_traj is not None:
-                tensor_prior = torch.as_tensor(prior_traj, dtype=torch.float32, device=self.device)
-                tensor_prior = self._normalize_action(tensor_prior)
-            else:
-                tensor_prior = torch.zeros(B, self.predict_size, 3, device=self.device)
-
-            prior_tokens = self.prior_encoder(tensor_prior)
-            gated_prior = self.visual_gate(rgbd_embed.mean(dim=1)) * prior_tokens
-
-            naction, critic_values = self._denoise(
-                pixelgoal_embed, rgbd_embed, gated_prior, zero_goal, zero_theta, sample_num
-            )
-            return self._postprocess(naction, critic_values, B, sample_num)
-
-
-def _smooth_trajectory_batch(trajectories: torch.Tensor) -> torch.Tensor:
-    """对 batch 轨迹做三次样条平滑（替代 NavDP 的 cumsum/4）。
-
-    Bridge-DP 输出绝对坐标，需要样条平滑保证 C2 连续性。
-
-    Args:
-        trajectories: (B, T, 3) 绝对坐标轨迹。
-
-    Returns:
-        smoothed: (B, T, 3) 平滑后轨迹。
-    """
-    device = trajectories.device
-    B, T, D = trajectories.shape
-    result = torch.zeros_like(trajectories)
-    t_in = np.linspace(0, 1, T)
-
-    for b in range(B):
-        traj_np = trajectories[b].cpu().numpy()
-        for d in range(D):
-            cs = CubicSpline(t_in, traj_np[:, d])
-            result[b, :, d] = torch.from_numpy(cs(t_in).astype(np.float32)).to(device)
-
-    return result
+            return self._predict_with_goal_embed(pixelgoal_embed, rgbd_embed, prior_traj, sample_num)
