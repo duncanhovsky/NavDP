@@ -23,9 +23,10 @@ python bridgedp_server.py \
     --nogoal_sigma_power 2.0 \
     --bridge_scale_invariant_sigma true \
     --bridge_anisotropic_xy true \
-    --bridge_normal_sigma_ratio 0.5 \
+    --bridge_normal_sigma_ratio 1.0 \
     --bridge_tangent_sigma_ratio 0.05 \
-    --bridge_theta_sigma_ratio 0.1 \
+    --bridge_theta_sigma_ratio 0.3 \
+    --bridge_envelope_frontload 1.0 \
     --enable_trajectory_normalization true \
     --trajectory_norm_target_distance 2.0 \
     --trajectory_norm_min_distance_m 0.10 \
@@ -39,7 +40,7 @@ python bridgedp_server.py \
     --scale_rgbd_film_use_layernorm true \
     --enable_goal_consistency_score true \
     --goal_consistency_terminal_weight 1.0 \
-    --goal_consistency_path_weight 0.2 \
+    --goal_consistency_path_weight 0.05 \
     --n_prior_tokens 4 \
     --num_train_timesteps 10 \
     --num_inference_timesteps 10 \

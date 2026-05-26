@@ -46,6 +46,7 @@ class BridgeDP_Policy(nn.Module):
         bridge_normal_sigma_ratio=0.25,
         bridge_tangent_sigma_ratio=0.03,
         bridge_theta_sigma_ratio=0.05,
+        bridge_envelope_frontload=0.0,
         n_prior_tokens=4,
         dropout=0.1,
         channels=3,
@@ -171,6 +172,7 @@ class BridgeDP_Policy(nn.Module):
             bridge_normal_sigma_ratio=bridge_normal_sigma_ratio,
             bridge_tangent_sigma_ratio=bridge_tangent_sigma_ratio,
             bridge_theta_sigma_ratio=bridge_theta_sigma_ratio,
+            bridge_envelope_frontload=bridge_envelope_frontload,
         )
 
         self.tgt_mask = (torch.triu(torch.ones(predict_size, predict_size)) == 1).transpose(0, 1)

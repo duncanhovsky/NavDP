@@ -56,6 +56,7 @@ parser.add_argument("--bridge_anisotropic_xy", type=str2bool, default=True)
 parser.add_argument("--bridge_normal_sigma_ratio", type=float, default=0.25)
 parser.add_argument("--bridge_tangent_sigma_ratio", type=float, default=0.03)
 parser.add_argument("--bridge_theta_sigma_ratio", type=float, default=0.05)
+parser.add_argument("--bridge_envelope_frontload", type=float, default=0.0)
 parser.add_argument("--n_prior_tokens", type=int, default=4)
 parser.add_argument("--enable_trajectory_normalization", type=str2bool, default=False)
 parser.add_argument("--trajectory_norm_target_distance", type=float, default=2.0)
@@ -114,6 +115,7 @@ def bridgedp_reset():
             bridge_normal_sigma_ratio=args.bridge_normal_sigma_ratio,
             bridge_tangent_sigma_ratio=args.bridge_tangent_sigma_ratio,
             bridge_theta_sigma_ratio=args.bridge_theta_sigma_ratio,
+            bridge_envelope_frontload=args.bridge_envelope_frontload,
             n_prior_tokens=args.n_prior_tokens,
             enable_trajectory_normalization=args.enable_trajectory_normalization,
             trajectory_norm_target_distance=args.trajectory_norm_target_distance,
@@ -197,6 +199,8 @@ def bridgedp_step_pointgoal():
     phase3_time = time.time()
     bridgedp_fps_writer.append_data(trajectory_mask)
     phase4_time = time.time()
+    early_steps = max(1, all_trajectory.shape[-2] // 4)
+    early_lateral_spread = np.std(all_trajectory[:, :, :early_steps, 1])
     print(
         "phase1:%f, phase2:%f, phase3:%f, phase4:%f, all:%f"
         % (
@@ -212,6 +216,7 @@ def bridgedp_step_pointgoal():
         f"[BridgeDP diag] goal={goal[0]}, "
         f"traj_x=[{execute_trajectory[:,:,0].min():.4f}, {execute_trajectory[:,:,0].max():.4f}], "
         f"traj_y=[{execute_trajectory[:,:,1].min():.4f}, {execute_trajectory[:,:,1].max():.4f}], "
+        f"early_y_std={early_lateral_spread:.4f}, "
         f"critic=[{all_values.min():.4f}, {all_values.max():.4f}], "
         f"traj_shape={execute_trajectory.shape}"
     )
