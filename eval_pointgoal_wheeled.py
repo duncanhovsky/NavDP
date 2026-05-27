@@ -5,6 +5,9 @@ parser = argparse.ArgumentParser(description="A script to run a car control simu
 parser.add_argument(
     "--scene_dir", type=str, default="./asset_scenes/cluttered_easy")
 parser.add_argument(
+    "--scene_name", type=str, default=None,
+    help="Exact scene subdirectory name; overrides --scene_index.")
+parser.add_argument(
     "--scene_index", type=int, default=8)
 parser.add_argument(
     "--scene_scale", type=float, default=1.0)
@@ -19,6 +22,8 @@ parser.add_argument(
 parser.add_argument(
     "--port", type=int, default=8888)
 args_cli = parser.parse_args()
+if args_cli.num_episodes < 1:
+    parser.error("--num_episodes must be a positive integer")
 app_launcher = AppLauncher(headless=False, enable_cameras=True)
 simulation_app = app_launcher.app
 
@@ -130,7 +135,12 @@ def planning_thread(env, camera_intrinsic):
         # Small sleep to prevent CPU overload
         time.sleep(0.1)
 
-scene_path = os.path.join(args_cli.scene_dir,os.listdir(args_cli.scene_dir)[args_cli.scene_index]) + "/"
+scene_name = args_cli.scene_name
+if scene_name is None:
+    scene_name = os.listdir(args_cli.scene_dir)[args_cli.scene_index]
+scene_path = os.path.join(args_cli.scene_dir, scene_name) + "/"
+if not os.path.isdir(scene_path):
+    raise FileNotFoundError(f"Scene sequence directory does not exist: {scene_path}")
 usd_path,init_path = find_usd_path(scene_path,task='pointgoal')
 scene_config = PointNavSceneCfg()
 scene_config.num_envs = args_cli.num_envs
@@ -255,7 +265,7 @@ while simulation_app.is_running():
             print("No trajectory available, using zero action")
         
         for i in range(args_cli.num_envs):
-            if dones[i] == True:
+            if dones[i] == True and len(evaluation_metrics) < args_cli.num_episodes:
                 episode_num += 1
                 navigator_reset(env_id=i,port=args_cli.port)
                 success_flag = (np.sqrt(np.square(goals[i]).sum())<1.5).astype(np.float32)
@@ -268,7 +278,7 @@ while simulation_app.is_running():
                 fps_writer[i] = imageio.get_writer(save_dir + "fps_%d.mp4"%episode_num, fps=10)
                 trajectory_length[i] = 0.0
         
-        if episode_num > args_cli.num_episodes:
+        if len(evaluation_metrics) >= args_cli.num_episodes:
             break
        
                 
