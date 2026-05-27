@@ -60,7 +60,7 @@ def nogoal_step(rgb_images,depth_images,port=8888):
     )
     return np.array(trajectory),np.array(all_trajectory),np.array(all_value)
 
-def pointgoal_step(point_goals,rgb_images,depth_images,port=8888):
+def pointgoal_step(point_goals,rgb_images,depth_images,port=8888,return_metadata=False):
     concat_images = np.concatenate([img for img in rgb_images],axis=0)
     concat_depths = np.concatenate([img for img in depth_images],axis=0)
     url = "http://localhost:%d/pointgoal_step"%port
@@ -88,6 +88,8 @@ def pointgoal_step(point_goals,rgb_images,depth_images,port=8888):
     trajectory, all_trajectory, all_value, payload = _parse_nav_response(
         requests.post(url, files=files, data=data)
     )
+    if return_metadata:
+        return np.array(trajectory), np.array(all_trajectory), np.array(all_value), payload
     if 'sub_pointgoal_pd' in payload:
         sub_pointgoal_pd = payload['sub_pointgoal_pd']
         return np.array(trajectory),np.array(all_trajectory),np.array(all_value),sub_pointgoal_pd

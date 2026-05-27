@@ -13,7 +13,6 @@ import os
 import cv2
 import numpy as np
 import torch
-from matplotlib import colormaps as cm
 
 from policy_network import BridgeDP_Policy
 
@@ -64,6 +63,14 @@ class BridgeDP_Agent:
         sample_num=16,
         exec_num_waypoints=24,
         exec_waypoint_spacing=0.15,
+        enable_safety_layer=True,
+        safety_clearance_m=0.25,
+        safety_path_sample_spacing_m=0.05,
+        safety_depth_max_m=5.0,
+        safety_projection_height_m=-0.20,
+        safety_height_band_px=8,
+        retry_sigma_growth=1.5,
+        max_retry_sigma_scale=3.0,
         navi_model="./bridgedp.ckpt",
         device='cuda:0',
     ):
@@ -75,6 +82,14 @@ class BridgeDP_Agent:
         self.sample_num = sample_num
         self.exec_num_waypoints = exec_num_waypoints
         self.exec_waypoint_spacing = float(exec_waypoint_spacing)
+        self.enable_safety_layer = bool(enable_safety_layer)
+        self.safety_clearance_m = float(safety_clearance_m)
+        self.safety_path_sample_spacing_m = float(safety_path_sample_spacing_m)
+        self.safety_depth_max_m = float(safety_depth_max_m)
+        self.safety_projection_height_m = float(safety_projection_height_m)
+        self.safety_height_band_px = int(safety_height_band_px)
+        self.retry_sigma_growth = float(retry_sigma_growth)
+        self.max_retry_sigma_scale = float(max_retry_sigma_scale)
 
         self.navi_former = BridgeDP_Policy(
             image_size=image_size,
@@ -177,10 +192,21 @@ class BridgeDP_Agent:
         self.stop_threshold = threshold
         self.memory_queue = [[] for _ in range(self.batch_size)]
         self.prior_curve_queue = [None for _ in range(self.batch_size)]
+        self.retry_sigma_scale = np.ones((self.batch_size,), dtype=np.float32)
+        self.last_safety_metadata = self._empty_safety_metadata()
 
     def reset_env(self, i):
         self.memory_queue[i] = []
         self.prior_curve_queue[i] = None
+        self.retry_sigma_scale[i] = 1.0
+
+    def _empty_safety_metadata(self):
+        return {
+            "status": ["disabled" for _ in range(getattr(self, "batch_size", 0))],
+            "selected_min_clearance_m": [None for _ in range(getattr(self, "batch_size", 0))],
+            "safe_candidate_count": [0 for _ in range(getattr(self, "batch_size", 0))],
+            "retry_sigma_scale": [1.0 for _ in range(getattr(self, "batch_size", 0))],
+        }
 
     def process_image(self, images):
         assert len(images.shape) == 4
@@ -270,8 +296,10 @@ class BridgeDP_Agent:
             n_value = n_values[i]
             for waypoints, value in zip(n_trajectory, n_value):
                 norm_value = np.clip(-value * 0.1, 0, 1)
-                colormap = cm.get('jet')
-                color = np.array(colormap(norm_value)[0:3]) * 255.0
+                color = cv2.applyColorMap(
+                    np.array([[int(norm_value * 255.0)]], dtype=np.uint8),
+                    cv2.COLORMAP_JET,
+                )[0, 0]
                 input_points = np.zeros((waypoints.shape[0], 3)) - 0.2
                 input_points[:, 0:2] = waypoints
                 input_points[:, 1] = -input_points[:, 1]
@@ -291,7 +319,7 @@ class BridgeDP_Agent:
                                 trajectory_mask,
                                 (int(camera_x[j]), int(camera_z[j])),
                                 (int(camera_x[j + 1]), int(camera_z[j + 1])),
-                                color.astype(np.uint8).tolist(),
+                                color.tolist(),
                                 5,
                             )
                     except Exception:
@@ -397,14 +425,118 @@ class BridgeDP_Agent:
             output[index] = self._resample_curve_to_exec_waypoints(trajectories[index])
         return output
 
-    def _finalize_step(self, images, raw_all_trajectory, all_values, raw_good_trajectory):
-        raw_good_trajectory = self._apply_stop_fallback(raw_good_trajectory, all_values)
-        self._update_prior(raw_good_trajectory)
+    def _depth_to_obstacle_points(self, depth):
+        """Project depth at robot-body height into local forward/lateral points."""
+        depth = np.asarray(depth, dtype=np.float32).squeeze()
+        if depth.ndim != 2:
+            return np.zeros((0, 2), dtype=np.float32)
+        intrinsic = np.asarray(self.image_intrinsic, dtype=np.float32)
+        fx, fy = intrinsic[0, 0], intrinsic[1, 1]
+        cx, cy = intrinsic[0, 2], intrinsic[1, 2]
+        height, width = depth.shape
+        stride = 2
+        vv, uu = np.mgrid[0:height:stride, 0:width:stride]
+        forward = depth[::stride, ::stride]
+        expected_v = (
+            height - 1
+            - fy * self.safety_projection_height_m / np.maximum(forward, 1e-6)
+            - cy
+        )
+        valid = (
+            np.isfinite(forward)
+            & (forward > 0.1)
+            & (forward < self.safety_depth_max_m)
+            & (np.abs(vv - expected_v) <= self.safety_height_band_px)
+        )
+        if not valid.any():
+            return np.zeros((0, 2), dtype=np.float32)
+        lateral = -(uu[valid] - cx) * forward[valid] / max(fx, 1e-6)
+        return np.stack([forward[valid], lateral], axis=-1).astype(np.float32)
 
+    def _dense_exec_path(self, trajectory):
+        points = np.concatenate(
+            [np.zeros((1, 2), dtype=np.float32), np.asarray(trajectory, dtype=np.float32)[:, :2]],
+            axis=0,
+        )
+        dense = [points[0]]
+        for start, end in zip(points[:-1], points[1:]):
+            length = float(np.linalg.norm(end - start))
+            steps = max(1, int(np.ceil(length / self.safety_path_sample_spacing_m)))
+            alpha = np.linspace(0.0, 1.0, steps + 1, dtype=np.float32)[1:]
+            dense.extend(start[None, :] + alpha[:, None] * (end - start)[None, :])
+        return np.asarray(dense, dtype=np.float32)
+
+    def _candidate_min_clearances(self, candidates, depth):
+        obstacles = self._depth_to_obstacle_points(depth)
+        if obstacles.shape[0] == 0:
+            return np.full((candidates.shape[0],), np.inf, dtype=np.float32)
+        min_clearances = []
+        for trajectory in candidates:
+            dense = self._dense_exec_path(trajectory)
+            clearance = np.linalg.norm(
+                dense[:, None, :] - obstacles[None, :, :], axis=-1
+            ).min()
+            min_clearances.append(float(clearance))
+        return np.asarray(min_clearances, dtype=np.float32)
+
+    def _select_safe_execution(self, raw_all_trajectory, exec_all_trajectory, all_values, depths):
+        selected_raw = np.zeros(
+            (self.batch_size, 1, self.predict_size, 3), dtype=np.float32
+        )
+        selected_exec = np.zeros(
+            (self.batch_size, self.exec_num_waypoints, 3), dtype=np.float32
+        )
+        status = []
+        selected_clearance = []
+        safe_count = []
+        for bid in range(self.batch_size):
+            clearances = self._candidate_min_clearances(exec_all_trajectory[bid], depths[bid])
+            safe = clearances >= self.safety_clearance_m
+            safe_indices = np.flatnonzero(safe)
+            safe_count.append(int(safe_indices.size))
+            if safe_indices.size > 0:
+                choice = safe_indices[np.argmax(all_values[bid, safe_indices])]
+                top_choice = int(np.argmax(all_values[bid]))
+                status.append("accepted_top1" if choice == top_choice else "accepted_safe_alternative")
+                selected_raw[bid, 0] = raw_all_trajectory[bid, choice]
+                selected_exec[bid] = exec_all_trajectory[bid, choice]
+                selected_clearance.append(
+                    None if not np.isfinite(clearances[choice]) else float(clearances[choice])
+                )
+                self.retry_sigma_scale[bid] = 1.0
+            else:
+                status.append("blocked_no_safe_candidate")
+                selected_clearance.append(
+                    None if clearances.size == 0 else float(np.nanmin(clearances))
+                )
+                self.retry_sigma_scale[bid] = min(
+                    self.max_retry_sigma_scale,
+                    self.retry_sigma_scale[bid] * self.retry_sigma_growth,
+                )
+        self.last_safety_metadata = {
+            "status": status,
+            "selected_min_clearance_m": selected_clearance,
+            "safe_candidate_count": safe_count,
+            "retry_sigma_scale": self.retry_sigma_scale.tolist(),
+        }
+        accepted = np.array([item.startswith("accepted") for item in status], dtype=bool)
+        for bid in np.flatnonzero(accepted):
+            self.prior_curve_queue[bid] = selected_raw[bid, 0].copy()
+        return selected_exec
+
+    def _finalize_step(self, images, depths, raw_all_trajectory, all_values, raw_good_trajectory, apply_safety=False):
         exec_all_trajectory = self._resample_candidates_to_exec(raw_all_trajectory)
-        exec_good_trajectory = self._resample_candidates_to_exec(raw_good_trajectory)
+        if apply_safety and self.enable_safety_layer:
+            exec_good_trajectory = self._select_safe_execution(
+                raw_all_trajectory, exec_all_trajectory, all_values, depths
+            )
+        else:
+            self.last_safety_metadata = self._empty_safety_metadata()
+            raw_good_trajectory = self._apply_stop_fallback(raw_good_trajectory, all_values)
+            self._update_prior(raw_good_trajectory)
+            exec_good_trajectory = self._resample_candidates_to_exec(raw_good_trajectory)[:, 0]
         trajectory_mask = self.project_trajectory(images, exec_all_trajectory, all_values)
-        return exec_good_trajectory[:, 0], exec_all_trajectory, all_values, trajectory_mask
+        return exec_good_trajectory, exec_all_trajectory, all_values, trajectory_mask
 
     def step_nogoal(self, images, depths):
         input_image = self._build_input_images(images)
@@ -417,7 +549,7 @@ class BridgeDP_Agent:
             prior_traj=prior_trajs,
             sample_num=self.sample_num,
         )
-        return self._finalize_step(images, raw_all, all_values, raw_good)
+        return self._finalize_step(images, depths, raw_all, all_values, raw_good)
 
     def step_pointgoal(self, goals, images, depths):
         input_image = self._build_input_images(images)
@@ -433,9 +565,12 @@ class BridgeDP_Agent:
             prior_traj=prior_trajs,
             theta_g=theta_g,
             sample_num=self.sample_num,
+            sampling_sigma_scale=self.retry_sigma_scale,
         )
         print(all_values.max(), all_values.min())
-        return self._finalize_step(images, raw_all, all_values, raw_good)
+        return self._finalize_step(
+            images, depths, raw_all, all_values, raw_good, apply_safety=True
+        )
 
     def step_imagegoal(self, goals, images, depths):
         input_image = self._build_input_images(images)
@@ -451,7 +586,7 @@ class BridgeDP_Agent:
             sample_num=self.sample_num,
         )
         print(all_values.max(), all_values.min())
-        return self._finalize_step(images, raw_all, all_values, raw_good)
+        return self._finalize_step(images, depths, raw_all, all_values, raw_good)
 
     def step_pixelgoal(self, goals, images, depths):
         input_image = self._build_input_images(images)
@@ -466,4 +601,4 @@ class BridgeDP_Agent:
             prior_traj=prior_trajs,
             sample_num=self.sample_num,
         )
-        return self._finalize_step(images, raw_all, all_values, raw_good)
+        return self._finalize_step(images, depths, raw_all, all_values, raw_good)

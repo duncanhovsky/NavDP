@@ -412,7 +412,16 @@ class BridgeDP_Policy(nn.Module):
             return self._normalize_trajectory_action(tensor_prior, distance_for_norm)
         return self._normalize_action(tensor_prior)
 
-    def predict_pointgoal_action(self, goal_point, input_images, input_depths, prior_traj=None, theta_g=None, sample_num=16):
+    def predict_pointgoal_action(
+        self,
+        goal_point,
+        input_images,
+        input_depths,
+        prior_traj=None,
+        theta_g=None,
+        sample_num=16,
+        sampling_sigma_scale=None,
+    ):
         with torch.no_grad():
             tensor_goal = torch.as_tensor(goal_point, dtype=torch.float32, device=self._device)
             B = tensor_goal.shape[0]
@@ -439,11 +448,18 @@ class BridgeDP_Policy(nn.Module):
             gated_prior = self._make_prior_tokens(tensor_prior, rgbd_embed)
 
             origin = torch.zeros_like(tensor_goal_n)
+            if sampling_sigma_scale is None:
+                sigma_repeated = 1.0
+            else:
+                sigma_repeated = torch.as_tensor(
+                    sampling_sigma_scale, dtype=tensor_goal_n.dtype, device=self._device
+                ).reshape(-1).repeat(sample_num)
             naction = self.bridge_scheduler.sample_initial_noise_ordered(
                 goal=tensor_goal_n.repeat(sample_num, 1),
                 origin=origin.repeat(sample_num, 1),
                 shape=(sample_num * B, self.predict_size, 3),
                 device=self._device,
+                sigma_scale=sigma_repeated,
             )
 
             self.bridge_scheduler.set_timesteps(self.num_inference_timesteps)

@@ -78,6 +78,14 @@ parser.add_argument("--use_prior_traj", type=str2bool, default=False)
 parser.add_argument("--sample_num", type=int, default=16)
 parser.add_argument("--exec_num_waypoints", type=int, default=24)
 parser.add_argument("--exec_waypoint_spacing", type=float, default=0.15)
+parser.add_argument("--enable_safety_layer", type=str2bool, default=True)
+parser.add_argument("--safety_clearance_m", type=float, default=0.25)
+parser.add_argument("--safety_path_sample_spacing_m", type=float, default=0.05)
+parser.add_argument("--safety_depth_max_m", type=float, default=5.0)
+parser.add_argument("--safety_projection_height_m", type=float, default=-0.20)
+parser.add_argument("--safety_height_band_px", type=int, default=8)
+parser.add_argument("--retry_sigma_growth", type=float, default=1.5)
+parser.add_argument("--max_retry_sigma_scale", type=float, default=3.0)
 args = parser.parse_known_args()[0]
 
 app = Flask(__name__)
@@ -137,6 +145,14 @@ def bridgedp_reset():
             sample_num=args.sample_num,
             exec_num_waypoints=args.exec_num_waypoints,
             exec_waypoint_spacing=args.exec_waypoint_spacing,
+            enable_safety_layer=args.enable_safety_layer,
+            safety_clearance_m=args.safety_clearance_m,
+            safety_path_sample_spacing_m=args.safety_path_sample_spacing_m,
+            safety_depth_max_m=args.safety_depth_max_m,
+            safety_projection_height_m=args.safety_projection_height_m,
+            safety_height_band_px=args.safety_height_band_px,
+            retry_sigma_growth=args.retry_sigma_growth,
+            max_retry_sigma_scale=args.max_retry_sigma_scale,
             navi_model=args.checkpoint,
             device=args.device,
         )
@@ -225,6 +241,7 @@ def bridgedp_step_pointgoal():
         'trajectory': execute_trajectory.tolist(),
         'all_trajectory': all_trajectory.tolist(),
         'all_values': all_values.tolist(),
+        'safety': bridgedp_navigator.last_safety_metadata,
     })
 
 

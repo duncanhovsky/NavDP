@@ -22,6 +22,10 @@ class PlanningOutput:
     all_trajectories_world: Optional[List[np.ndarray]] = None
     all_values_camera: Optional[np.ndarray] = None
     sub_pointgoal_pd: Optional[np.ndarray] = None
+    mpc_controllers: Optional[List[object]] = None
+    safety_stop_flags: Optional[np.ndarray] = None
+    safety_status: Optional[List[str]] = None
+    valid_safe_plan: Optional[np.ndarray] = None
     is_planning: bool = False
     planning_error: Optional[str] = None
 

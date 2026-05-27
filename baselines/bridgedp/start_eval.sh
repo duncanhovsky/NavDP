@@ -26,7 +26,7 @@ python bridgedp_server.py \
     --bridge_normal_sigma_ratio 1.0 \
     --bridge_tangent_sigma_ratio 0.05 \
     --bridge_theta_sigma_ratio 0.3 \
-    --bridge_envelope_frontload 1.0 \
+    --bridge_envelope_frontload 0.0 \
     --enable_trajectory_normalization true \
     --trajectory_norm_target_distance 2.0 \
     --trajectory_norm_min_distance_m 0.10 \
@@ -47,4 +47,9 @@ python bridgedp_server.py \
     --use_prior_traj false \
     --sample_num 16 \
     --exec_num_waypoints 24 \
-    --exec_waypoint_spacing 0.15
+    --exec_waypoint_spacing 0.15 \
+    --enable_safety_layer true \
+    --safety_clearance_m 0.25 \
+    --safety_path_sample_spacing_m 0.05 \
+    --retry_sigma_growth 1.5 \
+    --max_retry_sigma_scale 3.0

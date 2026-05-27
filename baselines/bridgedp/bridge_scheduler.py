@@ -213,6 +213,18 @@ class BridgeScheduler:
 
         return mu, tangent, normal, sigma_tangent, sigma_normal, sigma_theta, sigma_diag
 
+    @staticmethod
+    def _sigma_scale_tensor(sigma_scale, batch_size, device, dtype):
+        scale = torch.as_tensor(sigma_scale, device=device, dtype=dtype)
+        if scale.ndim == 0:
+            scale = scale.expand(batch_size)
+        scale = scale.reshape(-1)
+        if scale.shape[0] == 1 and batch_size > 1:
+            scale = scale.expand(batch_size)
+        if scale.shape[0] != batch_size:
+            raise ValueError(f"sigma_scale batch {scale.shape[0]} does not match {batch_size}")
+        return scale.view(batch_size, 1, 1)
+
     def sample_pointgoal_bridge_noise(
         self,
         shape: tuple,
@@ -222,12 +234,18 @@ class BridgeScheduler:
         theta_g: Optional[torch.Tensor] = None,
         origin: Optional[torch.Tensor] = None,
         noise: Optional[torch.Tensor] = None,
+        sigma_scale=1.0,
     ):
         B, _, dim = shape
         mu, tangent, normal, sigma_tangent, sigma_normal, sigma_theta, sigma_diag = (
             self.pointgoal_noise_params(shape, device, dtype, goal, theta_g, origin)
         )
         eps = torch.randn(shape, device=device, dtype=dtype) if noise is None else noise.to(device=device, dtype=dtype)
+        scale = self._sigma_scale_tensor(sigma_scale, B, device, dtype)
+        sigma_tangent = sigma_tangent * scale
+        sigma_normal = sigma_normal * scale
+        sigma_theta = sigma_theta * scale
+        sigma_diag = sigma_diag * scale
 
         bridge_noise = torch.zeros(shape, device=device, dtype=dtype)
         if dim >= 2:
@@ -435,6 +453,7 @@ class BridgeScheduler:
         origin: torch.Tensor,
         shape: tuple,
         device: torch.device,
+        sigma_scale=1.0,
     ) -> torch.Tensor:
         B, _, _ = shape
         if origin.dim() == 1:
@@ -444,7 +463,7 @@ class BridgeScheduler:
 
         if self.bridge_scale_invariant_sigma:
             bridge_noise, mu, _ = self.sample_pointgoal_bridge_noise(
-                shape, device, goal.dtype, goal=goal, origin=origin
+                shape, device, goal.dtype, goal=goal, origin=origin, sigma_scale=sigma_scale
             )
             return mu + bridge_noise
 
@@ -453,6 +472,9 @@ class BridgeScheduler:
         theta_g = torch.atan2(goal_vec[:, 1], goal_vec[:, 0])
         sigma_per_point = self.trajectory_std(
             shape, device, goal.dtype, goal=goal, theta_g=theta_g, origin=origin, mode="pointgoal"
+        )
+        sigma_per_point = sigma_per_point * self._sigma_scale_tensor(
+            sigma_scale, B, device, goal.dtype
         )
         noise = torch.randn(shape, device=device, dtype=goal.dtype)
         return mu + sigma_per_point * noise

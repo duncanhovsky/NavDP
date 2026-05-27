@@ -543,6 +543,10 @@ class DingoExploreTerminationsCfg:
 class PointNavTerminationsCfg:
     """Termination terms for the MDP."""
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
+    base_contact = DoneTerm(
+        func=mdp.illegal_contact,
+        params={"sensor_cfg": SceneEntityCfg("contact_sensor", body_names=DINGO_BASE_LINK), "threshold": DINGO_THRESHOLD},
+    )
     arrive_goal = DoneTerm(func=arrival_terminal_check,
                            params={"robot_asset_cfg":SceneEntityCfg("robot")})
     stuck = DoneTerm(func=stuck_terminal_check,
@@ -585,7 +589,7 @@ class DingoPointNavCfg(ManagerBasedRLEnvCfg):
         self.decimation = 15
         self.episode_length_s = 120.0
         self.sim.dt = 0.01
-        self.sim.disable_contact_processing = True
+        self.sim.disable_contact_processing = False
         
 @configclass
 class DingoImageNavCfg(ManagerBasedRLEnvCfg):
