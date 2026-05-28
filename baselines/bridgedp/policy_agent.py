@@ -59,6 +59,7 @@ class BridgeDP_Agent:
         goal_consistency_path_weight=0.2,
         num_train_timesteps=100,
         num_inference_timesteps=100,
+        inference_eta=0.0,
         use_prior_traj=False,
         sample_num=16,
         exec_num_waypoints=24,
@@ -113,6 +114,7 @@ class BridgeDP_Agent:
             goal_consistency_path_weight=goal_consistency_path_weight,
             num_train_timesteps=num_train_timesteps,
             num_inference_timesteps=num_inference_timesteps,
+            inference_eta=inference_eta,
             use_prior_traj=use_prior_traj,
             device=device,
         )

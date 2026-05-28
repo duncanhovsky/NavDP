@@ -65,6 +65,7 @@ class BridgeDP_Policy(nn.Module):
         goal_consistency_path_weight=0.2,
         num_train_timesteps=100,
         num_inference_timesteps=100,
+        inference_eta=0.0,
         use_prior_traj=False,
         device='cuda:0',
     ):
@@ -99,6 +100,7 @@ class BridgeDP_Policy(nn.Module):
         self.goal_consistency_path_weight = float(goal_consistency_path_weight)
         self.num_train_timesteps = int(num_train_timesteps)
         self.num_inference_timesteps = int(num_inference_timesteps)
+        self.inference_eta = float(inference_eta)
         self.use_prior_traj = use_prior_traj
 
         self.rgbd_encoder = BridgeDP_RGBD_Backbone(image_size, token_dim, memory_size, device)
@@ -468,6 +470,7 @@ class BridgeDP_Policy(nn.Module):
                     theta_g=theta_repeated,
                     origin=origin_repeated,
                     mode="pointgoal",
+                    eta=self.inference_eta,
                 )
 
             critic_values = self.predict_critic(naction, rgbd_embed, scale_embed)
@@ -514,7 +517,9 @@ class BridgeDP_Policy(nn.Module):
                     gated_prior,
                     scale_embed,
                 )
-                naction = self.bridge_scheduler.step_trajectory(x0_pred, naction, k, mode="nogoal")
+                naction = self.bridge_scheduler.step_trajectory(
+                    x0_pred, naction, k, mode="nogoal", eta=self.inference_eta
+                )
 
             critic_values = self.predict_critic(naction, rgbd_embed, scale_embed)
             trajectory_flat = self._denormalize_action(naction)
@@ -548,7 +553,9 @@ class BridgeDP_Policy(nn.Module):
                 gated_prior,
                 scale_embed,
             )
-            naction = self.bridge_scheduler.step_trajectory(x0_pred, naction, k, mode="nogoal")
+            naction = self.bridge_scheduler.step_trajectory(
+                x0_pred, naction, k, mode="nogoal", eta=self.inference_eta
+            )
 
         critic_values = self.predict_critic(naction, rgbd_embed, scale_embed)
         trajectory_flat = self._denormalize_action(naction)

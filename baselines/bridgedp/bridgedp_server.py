@@ -73,6 +73,7 @@ parser.add_argument("--goal_consistency_terminal_weight", type=float, default=1.
 parser.add_argument("--goal_consistency_path_weight", type=float, default=0.2)
 parser.add_argument("--num_train_timesteps", type=int, default=100)
 parser.add_argument("--num_inference_timesteps", type=int, default=100)
+parser.add_argument("--inference_eta", type=float, default=0.0)
 parser.add_argument("--use_prior_traj", type=str2bool, default=False)
 parser.add_argument("--sample_num", type=int, default=16)
 parser.add_argument("--exec_num_waypoints", type=int, default=24)
@@ -131,6 +132,7 @@ def bridgedp_reset():
             goal_consistency_path_weight=args.goal_consistency_path_weight,
             num_train_timesteps=args.num_train_timesteps,
             num_inference_timesteps=args.num_inference_timesteps,
+            inference_eta=args.inference_eta,
             use_prior_traj=args.use_prior_traj,
             sample_num=args.sample_num,
             exec_num_waypoints=args.exec_num_waypoints,

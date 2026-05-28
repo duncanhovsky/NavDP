@@ -226,7 +226,7 @@ while simulation_app.is_running():
                 t0 = time.time()
                 opt_u_controls, opt_x_states = mpc.solve(x0[i,:3])
                 print(f"solve mpc cost {time.time() - t0}")
-                v, w = opt_u_controls[1, 0], opt_u_controls[1, 1]
+                v, w = opt_u_controls[0, 0], opt_u_controls[0, 1]
                 action = torch.tensor([v, w], device="cuda:0")
                 action_cpu = action.cpu().numpy()
                 joint_velocities = controller.forward(action_cpu).joint_velocities
