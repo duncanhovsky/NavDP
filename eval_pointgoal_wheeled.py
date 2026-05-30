@@ -130,7 +130,27 @@ def planning_thread(env, camera_intrinsic):
         # Small sleep to prevent CPU overload
         time.sleep(0.1)
 
-scene_path = os.path.join(args_cli.scene_dir,os.listdir(args_cli.scene_dir)[args_cli.scene_index]) + "/"
+def list_scene_paths(scene_dir, task='pointgoal'):
+    scene_paths = []
+    for scene_name in sorted(os.listdir(scene_dir)):
+        path = os.path.join(scene_dir, scene_name)
+        if not os.path.isdir(path):
+            continue
+        usd_path, init_path = find_usd_path(path, task=task)
+        if usd_path and init_path:
+            scene_paths.append(path)
+    if not scene_paths:
+        raise FileNotFoundError(f"No {task} scenes found in {scene_dir}")
+    return scene_paths
+
+
+scene_paths = list_scene_paths(args_cli.scene_dir, task='pointgoal')
+if args_cli.scene_index < 0 or args_cli.scene_index >= len(scene_paths):
+    raise IndexError(
+        f"scene_index {args_cli.scene_index} out of range for {args_cli.scene_dir}; "
+        f"found {len(scene_paths)} pointgoal scenes"
+    )
+scene_path = scene_paths[args_cli.scene_index] + os.sep
 usd_path,init_path = find_usd_path(scene_path,task='pointgoal')
 scene_config = PointNavSceneCfg()
 scene_config.num_envs = args_cli.num_envs
@@ -168,9 +188,12 @@ controller = DifferentialController(name="simple_control",
                                     wheel_base=DINGO_WHEEL_BASE)
 algo = navigator_reset(camera_intrinsic.cpu().numpy(),batch_size=scene_config.num_envs,stop_threshold=args_cli.stop_threshold,port=args_cli.port)
 
-episode_num = args_cli.num_envs - 1
+completed_episodes = 0
+next_episode_num = args_cli.num_envs
 evaluation_metrics = []
-save_dir = "./pointgoal_%s_%s/%s/"%(algo,args_cli.scene_dir.split("/")[-1],scene_path.split("/")[-2])
+scene_group_name = os.path.basename(os.path.normpath(args_cli.scene_dir))
+scene_name = os.path.basename(os.path.normpath(scene_path))
+save_dir = "./pointgoal_%s_%s/%s/"%(algo,scene_group_name,scene_name)
 os.makedirs(save_dir,exist_ok=True)
 
 euclidean = np.sqrt(np.square(infos['observations']['goal_pose'].cpu().numpy()[:,0:2]).sum(axis=-1))
@@ -256,19 +279,22 @@ while simulation_app.is_running():
         
         for i in range(args_cli.num_envs):
             if dones[i] == True:
-                episode_num += 1
-                navigator_reset(env_id=i,port=args_cli.port)
                 success_flag = (np.sqrt(np.square(goals[i]).sum())<1.5).astype(np.float32)
                 fps_writer[i].close()
                 evaluation_metrics.append({'success':success_flag,
                                            'spl': np.clip(euclidean[i] / trajectory_length[i],0,1) * success_flag,
                                            'distance':euclidean[i]})
+                completed_episodes += 1
                 write_metrics(evaluation_metrics,save_dir+"metric.csv")
+                if completed_episodes >= args_cli.num_episodes:
+                    break
+                navigator_reset(env_id=i,port=args_cli.port)
                 euclidean[i] = np.sqrt(np.square(infos['observations']['goal_pose'].cpu().numpy()[:,0:2]).sum(axis=-1))[i]
-                fps_writer[i] = imageio.get_writer(save_dir + "fps_%d.mp4"%episode_num, fps=10)
+                fps_writer[i] = imageio.get_writer(save_dir + "fps_%d.mp4"%next_episode_num, fps=10)
+                next_episode_num += 1
                 trajectory_length[i] = 0.0
         
-        if episode_num > args_cli.num_episodes:
+        if completed_episodes >= args_cli.num_episodes:
             break
        
                 
